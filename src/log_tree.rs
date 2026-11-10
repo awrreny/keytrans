@@ -281,4 +281,14 @@ mod tests {
         let expected_root: Hash = expected.finalize().into();
         assert_eq!(tree.root(), expected_root);
     }
+
+    #[test]
+    fn hash_of_range_returns_complete_block_hash() {
+        let mut tree = LogTree::new(dummy_entry(1));
+        for timestamp in 2..=4 {
+            tree.append(dummy_entry(timestamp));
+        }
+
+        assert_eq!(tree.hash_of_range(0, 4), tree.complete_blocks[0].hash);
+    }
 }
