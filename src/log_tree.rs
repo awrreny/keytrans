@@ -92,6 +92,10 @@ impl LogTree {
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.log_entries.len()
+    }
+
     pub fn append(&mut self, entry: LogEntry) {
         let mut node = Node::new(&entry);
 
@@ -122,6 +126,97 @@ impl LogTree {
         accumulator[1..]
             .try_into()
             .expect("Accumulator is the wrong length")
+    }
+
+    pub fn prove(&self, leaf_index: usize) -> Vec<Hash> {
+        self.prove_aux(leaf_index, 0, self.size())
+    }
+
+    // Gives a proof of leaf i's inclusion, by giving the hashes of the copath
+    // left and right refer to which leaves are in the subtree currently being proved (used because we dont explicitly store the tree)
+    fn prove_aux(&self, i: usize, left: usize, right: usize) -> Vec<Hash> {
+        // leaf
+        if right - left == 1 {
+            return vec![];
+        }
+
+        // split range into left and right subtree
+        // left subtree contains leaves in range [left, mid) and right has [mid, right)
+        let largest_power_of_two_less_than = 1 << (right - left - 1).ilog2();
+        let mid = left + largest_power_of_two_less_than;
+
+        if i < mid {
+            let mut proof = self.prove_aux(i, left, mid);
+            proof.push(self.hash_of_range(mid, right));
+            proof
+        } else {
+            let mut proof = self.prove_aux(i, mid, right);
+            proof.push(self.hash_of_range(left, mid));
+            proof
+        }
+    }
+
+    // Hash of the subtree covering leaves [left, right).
+    // Assumes the range is a real subtree of the current tree (guaranteed by prove_aux)
+    fn hash_of_range(&self, left: usize, right: usize) -> Hash {
+        let length = (right - left) as u64;
+
+        // If the subtree doesn't have a power-of-two amount of nodes then it is one of the rightmost non-complete subtrees, and has to be rederived
+        if !length.is_power_of_two() {
+            // Should be true if the tree is left-balanced
+            debug_assert_eq!(right, self.log_entries.len());
+
+            let last = self
+                .complete_blocks
+                .last()
+                .expect("Complete block list should never be empty");
+            let mut accumulator = last.hash_content();
+            let mut leaf_count = last.leaf_count;
+
+            for node in self.complete_blocks.iter().rev().skip(1) {
+                let new_hash =
+                    Node::parent_hash_from_hash_contents(node.hash_content(), accumulator);
+                accumulator[0] = 0x01; // guaranteed to be a parent
+                accumulator[1..].copy_from_slice(&new_hash);
+
+                leaf_count += node.leaf_count;
+                if leaf_count == length {
+                    return new_hash;
+                }
+            }
+            panic!("Range does not correspond to a valid subtree");
+        }
+
+        // Otherwise the subtree we are looking for is perfectly balanced
+        let mut block_left = 0usize;
+        for block in &self.complete_blocks {
+            let block_right = block_left + block.leaf_count as usize;
+
+            if left >= block_left && right <= block_right {
+                let mut node = block;
+                let (mut node_left, mut node_right) = (block_left, block_right);
+
+                while (node_left, node_right) != (left, right) {
+                    let (l, r) = node
+                        .children
+                        .as_ref()
+                        .expect("Range should match a node in this block");
+                    let mid = node_left + l.leaf_count as usize;
+
+                    if right <= mid {
+                        node = l;
+                        node_right = mid;
+                    } else {
+                        debug_assert!(left >= mid);
+                        node = r;
+                        node_left = mid;
+                    }
+                }
+                return node.hash;
+            }
+            block_left = block_right;
+        }
+        panic!("Range is not within the tree");
     }
 }
 
