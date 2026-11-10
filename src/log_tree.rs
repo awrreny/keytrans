@@ -3,6 +3,10 @@ use sha2::{Digest, Sha256};
 type Hash = [u8; 32];
 type HashContent = [u8; 33];
 
+pub enum Error {
+    IndexOutOfRange { index: usize, tree_size: usize },
+}
+
 pub struct LogEntry {
     timestamp: u64,
     prefix_root: Hash,
@@ -128,8 +132,14 @@ impl LogTree {
             .expect("Accumulator is the wrong length")
     }
 
-    pub fn prove(&self, leaf_index: usize) -> Vec<Hash> {
-        self.prove_aux(leaf_index, 0, self.size())
+    pub fn prove(&self, leaf_index: usize) -> Result<Vec<Hash>, Error> {
+        if leaf_index >= self.size() {
+            return Err(Error::IndexOutOfRange {
+                index: leaf_index,
+                tree_size: self.size(),
+            });
+        }
+        Ok(self.prove_aux(leaf_index, 0, self.size()))
     }
 
     // Gives a proof of leaf i's inclusion, by giving the hashes of the copath
