@@ -258,6 +258,23 @@ mod tests {
         h.finalize().into()
     }
 
+    fn get_subtrees_as_ranges_aux(out: &mut Vec<(usize, usize)>, left: usize, right: usize) {
+        out.push((left, right));
+        if right - left <= 1 {
+            return
+        }
+        let mid = left + (1 << (right - left - 1).ilog2());
+        get_subtrees_as_ranges_aux(out, left, mid);
+        get_subtrees_as_ranges_aux(out, mid, right);
+    }
+
+    fn get_subtrees_as_ranges(leaf_count: usize) -> Vec<(usize, usize)> {
+        let mut out = vec![];
+        get_subtrees_as_ranges_aux(&mut out, 0, leaf_count);
+        out
+    }
+
+
     #[test]
     fn five_leaf_tree_splits_into_four_and_one_leaf_blocks() {
         let mut tree = LogTree::new(dummy_entry(1));
@@ -329,6 +346,21 @@ mod tests {
             leaves.push(dummy_entry(timestamp).get_hash());
 
             assert_eq!(tree.root(), naive_root_hash(&leaves), "tree size {timestamp}");
+        }
+    }
+
+    #[test]
+    fn hash_of_range_matches_naive_implementation() {
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+
+        for timestamp in 2..=48 {
+            tree.append(dummy_entry(timestamp));
+            leaves.push(dummy_entry(timestamp).get_hash());
+
+            for (left, right) in get_subtrees_as_ranges(leaves.len()) {
+                assert_eq!(tree.hash_of_range(left, right), naive_root_hash(&leaves[left..right]), "tree size {timestamp} from {left} to {right}");
+            }
         }
     }
 }
