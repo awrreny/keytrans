@@ -241,6 +241,23 @@ mod tests {
         }
     }
 
+    fn naive_root_hash(leaves: &[Hash]) -> Hash {
+        if leaves.len() == 1 {
+            return leaves[0]
+        }
+
+        let mid = 1 << (leaves.len() - 1).ilog2();
+        let left_hash = naive_root_hash(&leaves[..mid]);
+        let right_hash = naive_root_hash(&leaves[mid..]);
+
+        let mut h = Sha256::new();
+        h.update([if mid == 1 {0x00} else {0x01}]);
+        h.update(left_hash);
+        h.update([if leaves.len() - mid == 1 {0x00} else {0x01}]);
+        h.update(right_hash);
+        h.finalize().into()
+    }
+
     #[test]
     fn five_leaf_tree_splits_into_four_and_one_leaf_blocks() {
         let mut tree = LogTree::new(dummy_entry(1));
@@ -300,5 +317,18 @@ mod tests {
         }
 
         assert_eq!(tree.hash_of_range(0, 4), tree.complete_blocks[0].hash);
+    }
+
+    #[test]
+    fn root_hash_matches_naive_implementation() {
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+
+        for timestamp in 2..=64 {
+            tree.append(dummy_entry(timestamp));
+            leaves.push(dummy_entry(timestamp).get_hash());
+
+            assert_eq!(tree.root(), naive_root_hash(&leaves), "tree size {timestamp}");
+        }
     }
 }
