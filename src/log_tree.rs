@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 type Hash = [u8; 32];
 type HashContent = [u8; 33];
 
+#[derive(Debug)]
 pub enum Error {
     IndexOutOfRange { index: usize, tree_size: usize },
 }
@@ -50,12 +51,16 @@ impl Node {
         self.children.is_none()
     }
 
+    fn hash_content(&self) -> HashContent {
+        Node::hash_content_from_hash(self.is_leaf(), self.hash)
+    }
+
     // Specified in 11.8
     // https://www.ietf.org/archive/id/draft-ietf-keytrans-protocol-06.html#name-log-tree-2
-    fn hash_content(&self) -> HashContent {
+    fn hash_content_from_hash(is_leaf: bool, hash: Hash) -> HashContent {
         let mut out = [0u8; 33];
-        out[0] = if self.is_leaf() { 0x00 } else { 0x01 };
-        out[1..].copy_from_slice(&self.hash);
+        out[0] = if is_leaf { 0x00 } else { 0x01 };
+        out[1..].copy_from_slice(&hash);
         out
     }
 
@@ -230,6 +235,60 @@ impl LogTree {
     }
 }
 
+// Adapted from RFC 9162 Section 2.1.3.2
+pub fn verify_inclusion(
+    proof: &[Hash],
+    leaf_hash: Hash,
+    leaf_index: usize,
+    tree_size: usize,
+    expected_root: Hash,
+) -> bool {
+    if tree_size == 0 || leaf_index >= tree_size {
+        return false;
+    }
+
+    let mut node_index = leaf_index;
+    let mut last_index = tree_size - 1;
+    let mut level: u32 = 0;
+    let mut cur_hash_content = Node::hash_content_from_hash(true, leaf_hash);
+
+    for sibling_hash in proof {
+        if last_index == 0 {
+            return false;
+        }
+
+        // If the node is not on the same level as its sibling, treat it as if it is in a higher level
+        if node_index == last_index && node_index.is_multiple_of(2) {
+            while node_index.is_multiple_of(2) && node_index != 0 {
+                node_index >>= 1;
+                last_index >>= 1;
+                level += 1;
+            }
+        }
+
+        let is_last_left_child = node_index + 1 == last_index && node_index.is_multiple_of(2);
+
+        // Each node at this level covers 2**level leaves, so if there is 1 more than a multiple of that, the last must be in its own block, i.e. a leaf.
+        let sibling_is_leaf =
+            level == 0 || (is_last_left_child && (tree_size - 1).is_multiple_of(1 << level));
+
+        let sibling_hash_content = Node::hash_content_from_hash(sibling_is_leaf, *sibling_hash);
+
+        let parent_hash = if node_index % 2 == 1 {
+            Node::parent_hash_from_hash_contents(sibling_hash_content, cur_hash_content)
+        } else {
+            Node::parent_hash_from_hash_contents(cur_hash_content, sibling_hash_content)
+        };
+        cur_hash_content = Node::hash_content_from_hash(false, parent_hash);
+
+        node_index >>= 1;
+        last_index >>= 1;
+        level += 1;
+    }
+
+    last_index == 0 && cur_hash_content[1..] == expected_root[..]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +302,7 @@ mod tests {
 
     fn naive_root_hash(leaves: &[Hash]) -> Hash {
         if leaves.len() == 1 {
-            return leaves[0]
+            return leaves[0];
         }
 
         let mid = 1 << (leaves.len() - 1).ilog2();
@@ -251,9 +310,9 @@ mod tests {
         let right_hash = naive_root_hash(&leaves[mid..]);
 
         let mut h = Sha256::new();
-        h.update([if mid == 1 {0x00} else {0x01}]);
+        h.update([if mid == 1 { 0x00 } else { 0x01 }]);
         h.update(left_hash);
-        h.update([if leaves.len() - mid == 1 {0x00} else {0x01}]);
+        h.update([if leaves.len() - mid == 1 { 0x00 } else { 0x01 }]);
         h.update(right_hash);
         h.finalize().into()
     }
@@ -261,7 +320,7 @@ mod tests {
     fn get_subtrees_as_ranges_aux(out: &mut Vec<(usize, usize)>, left: usize, right: usize) {
         out.push((left, right));
         if right - left <= 1 {
-            return
+            return;
         }
         let mid = left + (1 << (right - left - 1).ilog2());
         get_subtrees_as_ranges_aux(out, left, mid);
@@ -273,7 +332,6 @@ mod tests {
         get_subtrees_as_ranges_aux(&mut out, 0, leaf_count);
         out
     }
-
 
     #[test]
     fn five_leaf_tree_splits_into_four_and_one_leaf_blocks() {
@@ -345,7 +403,11 @@ mod tests {
             tree.append(dummy_entry(timestamp));
             leaves.push(dummy_entry(timestamp).get_hash());
 
-            assert_eq!(tree.root(), naive_root_hash(&leaves), "tree size {timestamp}");
+            assert_eq!(
+                tree.root(),
+                naive_root_hash(&leaves),
+                "tree size {timestamp}"
+            );
         }
     }
 
@@ -359,8 +421,76 @@ mod tests {
             leaves.push(dummy_entry(timestamp).get_hash());
 
             for (left, right) in get_subtrees_as_ranges(leaves.len()) {
-                assert_eq!(tree.hash_of_range(left, right), naive_root_hash(&leaves[left..right]), "tree size {timestamp} from {left} to {right}");
+                assert_eq!(
+                    tree.hash_of_range(left, right),
+                    naive_root_hash(&leaves[left..right]),
+                    "tree size {timestamp} from {left} to {right}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn verify_inclusion_accepts_every_proof_up_to_twenty_leaves() {
+        for n in 1..=20usize {
+            let mut tree = LogTree::new(dummy_entry(1));
+            let mut leaves = vec![dummy_entry(1).get_hash()];
+            for timestamp in 2..=n {
+                tree.append(dummy_entry(timestamp as u64));
+                leaves.push(dummy_entry(timestamp as u64).get_hash());
+            }
+            let root = naive_root_hash(&leaves);
+
+            for i in 0..n {
+                let proof = tree.prove(i).expect("index in range");
+                assert!(
+                    verify_inclusion(&proof, leaves[i], i, n, root),
+                    "n = {n}, i = {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_inclusion_rejects_proof_checked_against_the_wrong_index() {
+        let n = 7;
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+        for timestamp in 2..=n {
+            tree.append(dummy_entry(timestamp as u64));
+            leaves.push(dummy_entry(timestamp as u64).get_hash());
+        }
+        let root = naive_root_hash(&leaves);
+
+        for i in 0..n {
+            let proof = tree.prove(i).expect("index in range");
+            for wrong_index in 0..n {
+                assert_eq!(
+                    verify_inclusion(&proof, leaves[i], wrong_index, n, root),
+                    i == wrong_index,
+                    "proof for leaf {i} checked against index {wrong_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_inclusion_rejects_tampered_or_truncated_proofs() {
+        let n = 9;
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+        for timestamp in 2..=n {
+            tree.append(dummy_entry(timestamp as u64));
+            leaves.push(dummy_entry(timestamp as u64).get_hash());
+        }
+        let root = naive_root_hash(&leaves);
+
+        let mut tampered = tree.prove(4).expect("index in range");
+        tampered[0][0] ^= 0x01;
+        assert!(!verify_inclusion(&tampered, leaves[4], 4, n, root));
+
+        let mut truncated = tree.prove(4).expect("index in range");
+        truncated.pop();
+        assert!(!verify_inclusion(&truncated, leaves[4], 4, n, root));
     }
 }
