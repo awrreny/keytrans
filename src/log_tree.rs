@@ -6,6 +6,9 @@ type HashContent = [u8; 33];
 #[derive(Debug)]
 pub enum Error {
     IndexOutOfRange { index: usize, tree_size: usize },
+    VerifyError {}, // TODO
+    RootMismatch {},
+    ProofTooShort {},
 }
 
 pub struct LogEntry {
@@ -52,30 +55,11 @@ impl Node {
     }
 
     fn hash_content(&self) -> HashContent {
-        Node::hash_content_from_hash(self.is_leaf(), self.hash)
-    }
-
-    // Specified in 11.8
-    // https://www.ietf.org/archive/id/draft-ietf-keytrans-protocol-06.html#name-log-tree-2
-    fn hash_content_from_hash(is_leaf: bool, hash: Hash) -> HashContent {
-        let mut out = [0u8; 33];
-        out[0] = if is_leaf { 0x00 } else { 0x01 };
-        out[1..].copy_from_slice(&hash);
-        out
-    }
-
-    fn parent_hash_from_hash_contents(
-        left_content: HashContent,
-        right_content: HashContent,
-    ) -> Hash {
-        let mut h = Sha256::new();
-        h.update(left_content);
-        h.update(right_content);
-        h.finalize().into()
+        hash_content_from_hash(self.is_leaf(), self.hash)
     }
 
     fn parent_hash_from_nodes(left: &Node, right: &Node) -> Hash {
-        Node::parent_hash_from_hash_contents(left.hash_content(), right.hash_content())
+        parent_hash_from_hash_contents(left.hash_content(), right.hash_content())
     }
 
     fn parent(left: Node, right: Node) -> Node {
@@ -127,7 +111,7 @@ impl LogTree {
             .hash_content();
 
         for node in self.complete_blocks.iter().rev().skip(1) {
-            let new_hash = Node::parent_hash_from_hash_contents(node.hash_content(), accumulator);
+            let new_hash = parent_hash_from_hash_contents(node.hash_content(), accumulator);
             accumulator[0] = 0x01; // guaranteed to be a parent
             accumulator[1..].copy_from_slice(&new_hash);
         }
@@ -174,41 +158,22 @@ impl LogTree {
             return;
         }
 
-        let is_retained_node = self.is_retained_node(retained_size, left, right);
+        let is_retained_node = is_retained_node(retained_size, left, right);
         if !node_contains_target && is_retained_node {
             return;
         }
 
-        let node_contains_retained = self.node_contains_retained(retained_size, left, right);
+        let node_contains_retained = node_contains_retained(retained_size, left, right);
 
         if node_size.is_power_of_two() && !node_contains_retained && !node_contains_target {
             proof.push(self.hash_of_range(left, right));
-            return
+            return;
         }
 
-        let largest_power_of_two_less_than = 1 << (right - left - 1).ilog2();
-        let mid = left + largest_power_of_two_less_than;
+        let mid = node_mid_from_range(left, right);
 
         self.prove_combined_aux(leaf_index, retained_size, left, mid, proof);
         self.prove_combined_aux(leaf_index, retained_size, mid, right, proof);
-
-
-    }
-
-    fn is_retained_node(&self, retained_size: usize, left: usize, right: usize) -> bool {
-        let node_size = right - left;
-
-        // sizes of retained trees is binary decomposition of retained_leaves
-        // node is a complete subtree
-        // && there is a retained head with the same size of the node
-        // && if you get rid of smaller retained heads, 'right' coincides with the remaining size of the retained heads
-        node_size.is_power_of_two()
-            && node_size & retained_size != 0
-            && right == (retained_size & !(node_size - 1))
-    }
-
-    fn node_contains_retained(&self, retained_size: usize, left: usize, right: usize) -> bool {
-        left < retained_size && (right > retained_size || !(right - left).is_power_of_two())
     }
 
     pub fn prove(&self, leaf_index: usize) -> Result<Vec<Hash>, Error> {
@@ -231,8 +196,7 @@ impl LogTree {
 
         // split range into left and right subtree
         // left subtree contains leaves in range [left, mid) and right has [mid, right)
-        let largest_power_of_two_less_than = 1 << (right - left - 1).ilog2();
-        let mid = left + largest_power_of_two_less_than;
+        let mid = node_mid_from_range(left, right);
 
         if i < mid {
             let mut proof = self.prove_aux(i, left, mid);
@@ -263,8 +227,7 @@ impl LogTree {
             let mut leaf_count = last.leaf_count;
 
             for node in self.complete_blocks.iter().rev().skip(1) {
-                let new_hash =
-                    Node::parent_hash_from_hash_contents(node.hash_content(), accumulator);
+                let new_hash = parent_hash_from_hash_contents(node.hash_content(), accumulator);
                 accumulator[0] = 0x01; // guaranteed to be a parent
                 accumulator[1..].copy_from_slice(&new_hash);
 
@@ -309,6 +272,133 @@ impl LogTree {
     }
 }
 
+pub fn verify_combined(
+    proof: &[Hash],
+    leaf_hash: Hash,
+    leaf_index: usize,
+    retained_size: usize,
+    retained_hashes: &[Hash],
+    tree_size: usize,
+    expected_root: Hash,
+) -> Result<(), Error> {
+    let computed_root = verify_combined_aux(
+        &mut proof.iter(),
+        leaf_hash,
+        leaf_index,
+        retained_size,
+        &mut retained_hashes.iter(),
+        0,
+        tree_size,
+    )?;
+
+    if computed_root == expected_root {
+        Ok(())
+    } else {
+        Err(Error::RootMismatch {})
+    }
+}
+
+fn verify_combined_aux<'a>(
+    proof: &mut impl Iterator<Item = &'a Hash>,
+    leaf_hash: Hash,
+    leaf_index: usize,
+    retained_size: usize,
+    retained_hashes: &mut impl Iterator<Item = &'a Hash>,
+    left: usize,
+    right: usize,
+) -> Result<Hash, Error> {
+    let node_size = right - left;
+    let node_contains_target = left <= leaf_index && leaf_index < right;
+
+    if node_contains_target && node_size == 1 {
+        return Ok(leaf_hash);
+    }
+
+    if is_retained_node(retained_size, left, right) {
+        // Must consume regardless if we use it
+        let retained_hash = retained_hashes.next();
+        if !node_contains_target {
+            return match retained_hash {
+                None => Err(Error::VerifyError {}),
+                Some(h) => Ok(*h),
+            };
+        }
+    }
+
+    if node_size.is_power_of_two()
+        && !node_contains_retained(retained_size, left, right)
+        && !node_contains_target
+    {
+        return match proof.next() {
+            None => Err(Error::ProofTooShort {}),
+            Some(h) => Ok(*h),
+        };
+    }
+
+    // guaranteed to not be leaf because of previous check
+    let mid = node_mid_from_range(left, right);
+    let left_hash = verify_combined_aux(
+        proof,
+        leaf_hash,
+        leaf_index,
+        retained_size,
+        retained_hashes,
+        left,
+        mid,
+    )?;
+    let left_hash_content = hash_content_from_hash((mid - left) == 1, left_hash);
+
+    let right_hash = verify_combined_aux(
+        proof,
+        leaf_hash,
+        leaf_index,
+        retained_size,
+        retained_hashes,
+        mid,
+        right,
+    )?;
+    let right_hash_content = hash_content_from_hash((right - mid) == 1, right_hash);
+
+    let node_hash = parent_hash_from_hash_contents(left_hash_content, right_hash_content);
+
+    Ok(node_hash)
+}
+
+fn is_retained_node(retained_size: usize, left: usize, right: usize) -> bool {
+    let node_size = right - left;
+
+    // sizes of retained trees is binary decomposition of retained_leaves
+    // node is a complete subtree
+    // && there is a retained head with the same size of the node
+    // && if you get rid of smaller retained heads, 'right' coincides with the remaining size of the retained heads
+    node_size.is_power_of_two()
+        && node_size & retained_size != 0
+        && right == (retained_size & !(node_size - 1))
+}
+
+fn node_contains_retained(retained_size: usize, left: usize, right: usize) -> bool {
+    left < retained_size && (right > retained_size || !(right - left).is_power_of_two())
+}
+
+fn node_mid_from_range(left: usize, right: usize) -> usize {
+    let largest_power_of_two_less_than = 1 << (right - left - 1).ilog2();
+    left + largest_power_of_two_less_than
+}
+
+fn hash_content_from_hash(is_leaf: bool, hash: Hash) -> HashContent {
+    let mut out = [0u8; 33];
+    out[0] = if is_leaf { 0x00 } else { 0x01 };
+    out[1..].copy_from_slice(&hash);
+    out
+}
+
+fn parent_hash_from_hash_contents(left_content: HashContent, right_content: HashContent) -> Hash {
+    let mut h = Sha256::new();
+    h.update(left_content);
+    h.update(right_content);
+    h.finalize().into()
+}
+
 // Adapted from RFC 9162 Section 2.1.3.2
 pub fn verify_inclusion(
     proof: &[Hash],
@@ -324,7 +414,7 @@ pub fn verify_inclusion(
     let mut node_index = leaf_index;
     let mut last_index = tree_size - 1;
     let mut level: u32 = 0;
-    let mut cur_hash_content = Node::hash_content_from_hash(true, leaf_hash);
+    let mut cur_hash_content = hash_content_from_hash(true, leaf_hash);
 
     for sibling_hash in proof {
         if last_index == 0 {
@@ -346,14 +436,14 @@ pub fn verify_inclusion(
         let sibling_is_leaf =
             level == 0 || (is_last_left_child && (tree_size - 1).is_multiple_of(1 << level));
 
-        let sibling_hash_content = Node::hash_content_from_hash(sibling_is_leaf, *sibling_hash);
+        let sibling_hash_content = hash_content_from_hash(sibling_is_leaf, *sibling_hash);
 
         let parent_hash = if node_index % 2 == 1 {
-            Node::parent_hash_from_hash_contents(sibling_hash_content, cur_hash_content)
+            parent_hash_from_hash_contents(sibling_hash_content, cur_hash_content)
         } else {
-            Node::parent_hash_from_hash_contents(cur_hash_content, sibling_hash_content)
+            parent_hash_from_hash_contents(cur_hash_content, sibling_hash_content)
         };
-        cur_hash_content = Node::hash_content_from_hash(false, parent_hash);
+        cur_hash_content = hash_content_from_hash(false, parent_hash);
 
         node_index >>= 1;
         last_index >>= 1;
