@@ -323,10 +323,6 @@ fn verify_combined_aux<'a>(
     let node_size = right - left;
     let node_contains_target = left <= leaf_index && leaf_index < right;
 
-    if node_contains_target && node_size == 1 {
-        return Ok(leaf_hash);
-    }
-
     let mut retained_expected = None;
     if is_retained_node(retained_size, left, right) {
         // If we don't stop recursion here, we still need to check that when we derive the hash for this node, this matches the retained hash.
@@ -339,6 +335,11 @@ fn verify_combined_aux<'a>(
                 retained_expected = Some(*h)
             }
         }
+    }
+
+    if node_contains_target && node_size == 1 {
+        verify_retained(retained_expected, leaf_hash)?;
+        return Ok(leaf_hash);
     }
 
     if node_size.is_power_of_two()
@@ -377,13 +378,18 @@ fn verify_combined_aux<'a>(
 
     let node_hash = parent_hash_from_hash_contents(left_hash_content, right_hash_content);
 
+    verify_retained(retained_expected, node_hash)?;
+
+    Ok(node_hash)
+}
+
+fn verify_retained(retained_expected: Option<Hash>, node_hash: Hash) -> Result<(), Error> {
     if let Some(h) = retained_expected
         && h != node_hash
     {
         return Err(Error::RetainedMismatch {});
-    }
-
-    Ok(node_hash)
+    };
+    Ok(())
 }
 
 fn is_retained_node(retained_size: usize, left: usize, right: usize) -> bool {
@@ -627,10 +633,10 @@ mod tests {
             }
             let root = naive_root_hash(&leaves);
 
-            for i in 0..n {
+            for (i, &leaf) in leaves.iter().enumerate() {
                 let proof = tree.prove(i).expect("index in range");
                 assert!(
-                    verify_inclusion(&proof, leaves[i], i, n, root),
+                    verify_inclusion(&proof, leaf, i, n, root),
                     "n = {n}, i = {i}"
                 );
             }
@@ -648,11 +654,11 @@ mod tests {
         }
         let root = naive_root_hash(&leaves);
 
-        for i in 0..n {
+        for (i, &leaf) in leaves.iter().enumerate() {
             let proof = tree.prove(i).expect("index in range");
             for wrong_index in 0..n {
                 assert_eq!(
-                    verify_inclusion(&proof, leaves[i], wrong_index, n, root),
+                    verify_inclusion(&proof, leaf, wrong_index, n, root),
                     i == wrong_index,
                     "proof for leaf {i} checked against index {wrong_index}"
                 );
@@ -706,10 +712,10 @@ mod tests {
 
             for retained in 0..=n {
                 let heads = naive_retained_heads(&leaves[..retained]);
-                for i in 0..n {
+                for (i, &leaf) in leaves.iter().enumerate() {
                     let proof = tree.prove_combined(i, retained).expect("index in range");
                     assert!(
-                        verify_combined(&proof, leaves[i], i, retained, &heads, n, root).is_ok(),
+                        verify_combined(&proof, leaf, i, retained, &heads, n, root).is_ok(),
                         "n = {n}, retained = {retained}, i = {i}"
                     );
                 }
@@ -731,12 +737,11 @@ mod tests {
         let retained = 4;
         let heads = naive_retained_heads(&leaves[..retained]);
 
-        for i in 0..n {
+        for (i, &leaf) in leaves.iter().enumerate() {
             let proof = tree.prove_combined(i, retained).expect("index in range");
             for wrong_index in 0..n {
                 assert_eq!(
-                    verify_combined(&proof, leaves[i], wrong_index, retained, &heads, n, root)
-                        .is_ok(),
+                    verify_combined(&proof, leaf, wrong_index, retained, &heads, n, root).is_ok(),
                     i == wrong_index,
                     "proof for leaf {i} checked against index {wrong_index}"
                 );
