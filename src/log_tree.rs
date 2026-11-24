@@ -137,6 +137,80 @@ impl LogTree {
             .expect("Accumulator is the wrong length")
     }
 
+    pub fn prove_combined(
+        &self,
+        leaf_index: usize,
+        retained_leaves: usize,
+    ) -> Result<Vec<Hash>, Error> {
+        if leaf_index >= self.size() {
+            return Err(Error::IndexOutOfRange {
+                index: leaf_index,
+                tree_size: self.size(),
+            });
+        }
+
+        let mut proof = vec![];
+        self.prove_combined_aux(leaf_index, retained_leaves, 0, self.size(), &mut proof);
+        Ok(proof)
+    }
+
+    fn prove_combined_aux(
+        &self,
+        leaf_index: usize,
+        retained_size: usize,
+        left: usize,
+        right: usize,
+        proof: &mut Vec<Hash>,
+    ) {
+        let node_size = right - left;
+        let node_contains_target = left <= leaf_index && leaf_index < right;
+        // target leaf: continue
+        // retained and target is not inside: continue
+        // node complete and doesn't contain anything retained or target: add to proof, continue
+        // otherwise recurse (error if leaf, actually leaf case is completely covered)
+
+        // Leaf to be proved is not in the proof
+        if node_contains_target && node_size == 1 {
+            return;
+        }
+
+        let is_retained_node = self.is_retained_node(retained_size, left, right);
+        if !node_contains_target && is_retained_node {
+            return;
+        }
+
+        let node_contains_retained = self.node_contains_retained(retained_size, left, right);
+
+        if node_size.is_power_of_two() && !node_contains_retained && !node_contains_target {
+            proof.push(self.hash_of_range(left, right));
+            return
+        }
+
+        let largest_power_of_two_less_than = 1 << (right - left - 1).ilog2();
+        let mid = left + largest_power_of_two_less_than;
+
+        self.prove_combined_aux(leaf_index, retained_size, left, mid, proof);
+        self.prove_combined_aux(leaf_index, retained_size, mid, right, proof);
+
+
+    }
+
+    fn is_retained_node(&self, retained_size: usize, left: usize, right: usize) -> bool {
+        let node_size = right - left;
+
+        // sizes of retained trees is binary decomposition of retained_leaves
+        // node is a complete subtree
+        // && there is a retained head with the same size of the node
+        // && if you get rid of smaller retained heads, 'right' coincides with the remaining size of the retained heads
+        node_size.is_power_of_two()
+            && node_size & retained_size != 0
+            && right == (retained_size & !(node_size - 1))
+    }
+
+    fn node_contains_retained(&self, retained_size: usize, left: usize, right: usize) -> bool {
+        left < retained_size && (right > retained_size || !(right - left).is_power_of_two())
+    }
+
     pub fn prove(&self, leaf_index: usize) -> Result<Vec<Hash>, Error> {
         if leaf_index >= self.size() {
             return Err(Error::IndexOutOfRange {
