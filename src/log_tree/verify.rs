@@ -11,6 +11,7 @@ pub enum VerifyError {
     RetainedTooShort {},
     RetainedTooLong {},
     RetainedMismatch {},
+    TargetsNotStrictlyIncreasing {},
 }
 
 pub fn verify_combined(
@@ -22,13 +23,34 @@ pub fn verify_combined(
     tree_size: usize,
     expected_root: Hash,
 ) -> Result<(), VerifyError> {
+    verify_combined_multi(
+        proof,
+        &[(leaf_index, leaf_hash)],
+        retained_size,
+        retained_hashes,
+        tree_size,
+        expected_root,
+    )
+}
+
+pub fn verify_combined_multi(
+    proof: &[Hash],
+    targets: &[(usize, Hash)],
+    retained_size: usize,
+    retained_hashes: &[Hash],
+    tree_size: usize,
+    expected_root: Hash,
+) -> Result<(), VerifyError> {
+    if !targets.windows(2).all(|w| w[0].0 < w[1].0) {
+        return Err(VerifyError::TargetsNotStrictlyIncreasing {});
+    }
+
     let mut proof = proof.iter();
     let mut retained_hashes = retained_hashes.iter();
 
     let computed_root = verify_combined_aux(
         &mut proof,
-        leaf_hash,
-        leaf_index,
+        targets,
         retained_size,
         &mut retained_hashes,
         0,
@@ -52,15 +74,14 @@ pub fn verify_combined(
 
 fn verify_combined_aux<'a>(
     proof: &mut impl Iterator<Item = &'a Hash>,
-    leaf_hash: Hash,
-    leaf_index: usize,
+    targets: &[(usize, Hash)],
     retained_size: usize,
     retained_hashes: &mut impl Iterator<Item = &'a Hash>,
     left: usize,
     right: usize,
 ) -> Result<Hash, VerifyError> {
     let node_size = right - left;
-    let node_contains_target = left <= leaf_index && leaf_index < right;
+    let node_contains_target = !targets.is_empty();
 
     let mut retained_expected = None;
     if is_retained_node(retained_size, left, right) {
@@ -77,6 +98,8 @@ fn verify_combined_aux<'a>(
     }
 
     if node_contains_target && node_size == 1 {
+        debug_assert!(targets.len() == 1);
+        let (_, leaf_hash) = targets[0];
         verify_retained(retained_expected, leaf_hash)?;
         return Ok(leaf_hash);
     }
@@ -93,10 +116,11 @@ fn verify_combined_aux<'a>(
 
     // guaranteed to not be leaf because of previous check
     let mid = node_mid_from_range(left, right);
+    let split = targets.partition_point(|&(i, _)| i < mid);
+
     let left_hash = verify_combined_aux(
         proof,
-        leaf_hash,
-        leaf_index,
+        &targets[..split],
         retained_size,
         retained_hashes,
         left,
@@ -106,8 +130,7 @@ fn verify_combined_aux<'a>(
 
     let right_hash = verify_combined_aux(
         proof,
-        leaf_hash,
-        leaf_index,
+        &targets[split..],
         retained_size,
         retained_hashes,
         mid,
@@ -188,7 +211,7 @@ pub fn verify_inclusion(
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{dummy_entry, naive_retained_heads, naive_root_hash};
-    use super::super::tree::LogTree;
+    use super::super::tree::{LogTree, ProveError};
     use super::*;
 
     #[test]
@@ -388,5 +411,191 @@ mod tests {
 
         let proof = tree.prove_combined(4, retained).expect("index in range");
         assert!(verify_combined(&proof, leaves[4], 4, retained, &heads, n, root).is_err());
+    }
+
+    #[test]
+    fn verify_combined_multi_accepts_every_pair_of_leaves_up_to_twenty_leaves() {
+        for n in 1..=20usize {
+            let mut tree = LogTree::new(dummy_entry(1));
+            let mut leaves = vec![dummy_entry(1).get_hash()];
+            for timestamp in 2..=n {
+                tree.append(dummy_entry(timestamp as u64));
+                leaves.push(dummy_entry(timestamp as u64).get_hash());
+            }
+            let root = naive_root_hash(&leaves);
+
+            for retained in 0..=n {
+                let heads = naive_retained_heads(&leaves[..retained]);
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        let proof = tree
+                            .prove_combined_multi(&[i, j], retained)
+                            .expect("in range");
+                        assert!(
+                            verify_combined_multi(
+                                &proof,
+                                &[(i, leaves[i]), (j, leaves[j])],
+                                retained,
+                                &heads,
+                                n,
+                                root
+                            )
+                            .is_ok(),
+                            "n = {n}, retained = {retained}, targets = {i}, {j}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verify_combined_multi_accepts_empty_targets_up_to_twenty_leaves() {
+        for n in 1..=20usize {
+            let mut tree = LogTree::new(dummy_entry(1));
+            let mut leaves = vec![dummy_entry(1).get_hash()];
+            for timestamp in 2..=n {
+                tree.append(dummy_entry(timestamp as u64));
+                leaves.push(dummy_entry(timestamp as u64).get_hash());
+            }
+            let root = naive_root_hash(&leaves);
+
+            for retained in 0..=n {
+                let heads = naive_retained_heads(&leaves[..retained]);
+                let proof = tree.prove_combined_multi(&[], retained).expect("in range");
+                assert!(
+                    verify_combined_multi(&proof, &[], retained, &heads, n, root).is_ok(),
+                    "n = {n}, retained = {retained}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn combined_multi_rejects_unsorted_duplicate_and_out_of_range_targets() {
+        let n = 5;
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+        for timestamp in 2..=n {
+            tree.append(dummy_entry(timestamp as u64));
+            leaves.push(dummy_entry(timestamp as u64).get_hash());
+        }
+        let root = naive_root_hash(&leaves);
+
+        let retained = 2;
+        let heads = naive_retained_heads(&leaves[..retained]);
+
+        assert!(matches!(
+            tree.prove_combined_multi(&[3, 1], retained),
+            Err(ProveError::TargetsNotStrictlyIncreasing {})
+        ));
+        assert!(matches!(
+            tree.prove_combined_multi(&[1, 1], retained),
+            Err(ProveError::TargetsNotStrictlyIncreasing {})
+        ));
+        assert!(matches!(
+            tree.prove_combined_multi(&[1, n], retained),
+            Err(ProveError::IndexOutOfRange { index, tree_size }) if index == n && tree_size == n
+        ));
+
+        let proof = tree
+            .prove_combined_multi(&[1, 3], retained)
+            .expect("in range");
+        assert!(matches!(
+            verify_combined_multi(
+                &proof,
+                &[(3, leaves[3]), (1, leaves[1])],
+                retained,
+                &heads,
+                n,
+                root
+            ),
+            Err(VerifyError::TargetsNotStrictlyIncreasing {})
+        ));
+        assert!(matches!(
+            verify_combined_multi(
+                &proof,
+                &[(1, leaves[1]), (1, leaves[3])],
+                retained,
+                &heads,
+                n,
+                root
+            ),
+            Err(VerifyError::TargetsNotStrictlyIncreasing {})
+        ));
+    }
+
+    #[test]
+    fn verify_combined_multi_rejects_tampered_truncated_or_extended_proofs() {
+        let n = 9;
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+        for timestamp in 2..=n {
+            tree.append(dummy_entry(timestamp as u64));
+            leaves.push(dummy_entry(timestamp as u64).get_hash());
+        }
+        let root = naive_root_hash(&leaves);
+
+        let retained = 5;
+        let heads = naive_retained_heads(&leaves[..retained]);
+        let targets = [(1, leaves[1]), (6, leaves[6])];
+
+        let proof = tree
+            .prove_combined_multi(&[1, 6], retained)
+            .expect("in range");
+        assert!(verify_combined_multi(&proof, &targets, retained, &heads, n, root).is_ok());
+
+        assert!(
+            verify_combined_multi(
+                &proof,
+                &[(1, leaves[1]), (7, leaves[7])],
+                retained,
+                &heads,
+                n,
+                root
+            )
+            .is_err()
+        );
+
+        let mut tampered = proof.clone();
+        tampered[0][0] ^= 0x01;
+        assert!(verify_combined_multi(&tampered, &targets, retained, &heads, n, root).is_err());
+
+        let mut truncated = proof.clone();
+        truncated.pop();
+        assert!(verify_combined_multi(&truncated, &targets, retained, &heads, n, root).is_err());
+
+        let mut extended = proof.clone();
+        extended.push([0xAB; 32]);
+        assert!(verify_combined_multi(&extended, &targets, retained, &heads, n, root).is_err());
+    }
+
+    #[test]
+    fn verify_combined_multi_checks_retained_head_containing_both_targets() {
+        let n = 9;
+        let mut tree = LogTree::new(dummy_entry(1));
+        let mut leaves = vec![dummy_entry(1).get_hash()];
+        for timestamp in 2..=n {
+            tree.append(dummy_entry(timestamp as u64));
+            leaves.push(dummy_entry(timestamp as u64).get_hash());
+        }
+        let root = naive_root_hash(&leaves);
+
+        // retained = 8 is a single size-8 head containing both targets
+        let retained = 8;
+        let heads = naive_retained_heads(&leaves[..retained]);
+        let targets = [(2, leaves[2]), (6, leaves[6])];
+
+        let proof = tree
+            .prove_combined_multi(&[2, 6], retained)
+            .expect("in range");
+        assert!(verify_combined_multi(&proof, &targets, retained, &heads, n, root).is_ok());
+
+        let mut wrong_retained_head = heads.clone();
+        wrong_retained_head[0][0] ^= 0x01;
+        assert!(
+            verify_combined_multi(&proof, &targets, retained, &wrong_retained_head, n, root)
+                .is_err()
+        );
     }
 }

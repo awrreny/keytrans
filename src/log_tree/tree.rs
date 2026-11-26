@@ -8,6 +8,7 @@ use super::tree_math::{
 #[derive(Debug)]
 pub enum ProveError {
     IndexOutOfRange { index: usize, tree_size: usize },
+    TargetsNotStrictlyIncreasing {},
 }
 
 pub struct LogEntry {
@@ -125,28 +126,20 @@ impl LogTree {
         leaf_index: usize,
         retained_leaves: usize,
     ) -> Result<Vec<Hash>, ProveError> {
-        if leaf_index >= self.size() {
-            return Err(ProveError::IndexOutOfRange {
-                index: leaf_index,
-                tree_size: self.size(),
-            });
-        }
-
-        let mut proof = vec![];
-        self.prove_combined_aux(leaf_index, retained_leaves, 0, self.size(), &mut proof);
-        Ok(proof)
+        self.prove_combined_multi(&[leaf_index], retained_leaves)
     }
 
+    // Invariant: `targets` is strictly increasing and every index is in [left, right)
     fn prove_combined_aux(
         &self,
-        leaf_index: usize,
+        targets: &[usize],
         retained_size: usize,
         left: usize,
         right: usize,
         proof: &mut Vec<Hash>,
     ) {
         let node_size = right - left;
-        let node_contains_target = left <= leaf_index && leaf_index < right;
+        let node_contains_target = !targets.is_empty();
         // target leaf: continue
         // retained and target is not inside: continue
         // node complete and doesn't contain anything retained or target: add to proof, continue
@@ -170,9 +163,34 @@ impl LogTree {
         }
 
         let mid = node_mid_from_range(left, right);
+        let split = targets.partition_point(|&i| i < mid);
 
-        self.prove_combined_aux(leaf_index, retained_size, left, mid, proof);
-        self.prove_combined_aux(leaf_index, retained_size, mid, right, proof);
+        self.prove_combined_aux(&targets[..split], retained_size, left, mid, proof);
+        self.prove_combined_aux(&targets[split..], retained_size, mid, right, proof);
+    }
+
+    // Prove the inclusion of multiple (or 0) leaves
+    pub fn prove_combined_multi(
+        &self,
+        targets: &[usize],
+        retained_leaves: usize,
+    ) -> Result<Vec<Hash>, ProveError> {
+        for &index in targets {
+            if index >= self.size() {
+                return Err(ProveError::IndexOutOfRange {
+                    index,
+                    tree_size: self.size(),
+                });
+            }
+        }
+
+        if !targets.windows(2).all(|w| w[0] < w[1]) {
+            return Err(ProveError::TargetsNotStrictlyIncreasing {});
+        }
+
+        let mut proof = vec![];
+        self.prove_combined_aux(targets, retained_leaves, 0, self.size(), &mut proof);
+        Ok(proof)
     }
 
     pub fn prove(&self, leaf_index: usize) -> Result<Vec<Hash>, ProveError> {
